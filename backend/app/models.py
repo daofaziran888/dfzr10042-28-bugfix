@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -491,22 +491,76 @@ class AttributionModel:
 
         Args:
             touchpoints: 触点列表，每项包含 user_id, channel, timestamp
-            conversions: 转化列表，每项包含 user_id, conversion_time
+            conversions: 转化列表，每项包含 user_id, conversion_time，
+                可选 order_id（同 order_id 重复提交只计一次）
 
         Returns:
             {channel: attribution_weight}
+
+        只接受落在归因窗口内且不晚于购买时刻的触点；早到/超窗数据在
+        ``funnel_engine`` 匹配阶段就不会成为确认路径，这里再做一次防御。
         """
+        prepared = _prepare_attribution_inputs(
+            touchpoints, conversions, self.attribution_window_days
+        )
         if self.algorithm == AttributionAlgorithm.FIRST_TOUCH:
-            return _first_touch_attribution(touchpoints, conversions, self.attribution_window_days)
+            return _first_touch_attribution(prepared)
         elif self.algorithm == AttributionAlgorithm.LAST_TOUCH:
-            return _last_touch_attribution(touchpoints, conversions, self.attribution_window_days)
+            return _last_touch_attribution(prepared)
         elif self.algorithm == AttributionAlgorithm.LINEAR:
-            return _linear_attribution(touchpoints, conversions, self.attribution_window_days)
+            return _linear_attribution(prepared)
         elif self.algorithm == AttributionAlgorithm.TIME_DECAY:
-            return _time_decay_attribution(touchpoints, conversions, self.attribution_window_days)
+            return _time_decay_attribution(prepared)
         elif self.algorithm == AttributionAlgorithm.POSITION_BASED:
-            return _position_based_attribution(touchpoints, conversions, self.attribution_window_days)
+            return _position_based_attribution(prepared)
         return {}
+
+    def attribute_paths(
+        self,
+        confirmed_paths: list[dict[str, Any]],
+        *,
+        dedupe_orders: bool = True,
+    ) -> dict[str, Any]:
+        """从漏斗引擎确认的转化路径直接做归因。
+
+        归因复盘只领用已确认的转化路径数据：每个路径还原出实际进店触点
+        （entry_time + channel）与购买时刻（conversion_time + order_id），
+        早到和超窗购买不在 ``confirmed_paths`` 中，天然不参与归因。
+        返回渠道权重、逐单明细和去重订单数，便于核对同一笔购买只贡献一次。
+
+        ``dedupe_orders`` 为 True 时同一 order_id 只取一条路径，适用于单
+        漏斗复盘；跨渠道仲裁时同一订单在每个渠道各有一条证据路径，需要
+        传 False 让各渠道触点共同参与权重分配（渠道级去重在仲裁层完成）。
+        """
+        touchpoints: list[dict[str, Any]] = []
+        conversions: list[dict[str, Any]] = []
+        seen_orders: set[Any] = set()
+        for path in confirmed_paths:
+            order_id = path.get("order_id")
+            if dedupe_orders and order_id is not None:
+                if order_id in seen_orders:
+                    continue
+                seen_orders.add(order_id)
+            touchpoints.append({
+                "user_id": path["user_id"],
+                "channel": path.get("channel", "unknown"),
+                "timestamp": path["entry_time"],
+                "order_id": order_id,
+            })
+            conversions.append({
+                "user_id": path["user_id"],
+                "conversion_time": path["conversion_time"],
+                "order_id": order_id,
+            })
+        weights = self.attribute(touchpoints, conversions)
+        return {
+            "model_id": self.model_id,
+            "algorithm": self.algorithm.value,
+            "window_days": self.attribution_window_days,
+            "channel_weights": weights,
+            "order_ids": [c["order_id"] for c in conversions],
+            "conversion_count": len(conversions),
+        }
 
 
 # ============================================================
@@ -523,48 +577,34 @@ class FunnelDef:
     step_counts: list[int] = field(default_factory=list)
     step_rates: list[float] = field(default_factory=list)
     total_conversion_rate: float = 0.0
+    # 已确认的完整转化路径（步骤按事件时间有序且全程在转化窗口内）
+    conversion_paths: list[dict[str, Any]] = field(default_factory=list)
+    # 被拒绝的路径尝试（早到购买/超窗购买/重复订单），不进入任何分母
+    rejected_paths: list[dict[str, Any]] = field(default_factory=list)
 
     def compute_funnel(self, user_events: dict[str, list[dict[str, Any]]]) -> FunnelDef:
-        """计算每个步骤的用户量和转化率。
+        """按事件时间顺序核验步骤并计算每个步骤的用户量和转化率。
 
         Args:
-            user_events: {user_id: [{event_name, timestamp}, ...]}
+            user_events: {user_id: [{event_name, timestamp, ...}]}，
+                事件可以乱序送入，引擎会先按 timestamp 归一化排序再匹配。
+
+        修复点：旧实现只判断用户“是否出现过”某事件，先购买后进店会被
+        错位计入、超过 ``conversion_window_hours`` 的购买会残留进转化分母。
+        现在严格要求后续步骤时间晚于前序步骤且全程在时窗内，每个用户每步
+        最多计一人，同一订单只确认一次。
         """
+        from app.funnel_engine import match_funnel
+
         if not self.steps:
             return self
         step_event_names = [step.event_name for step in self.steps]
-
-        # Step 1: count users who triggered the first event
-        step_users: list[set[str]] = [set()]
-        for uid, events in user_events.items():
-            if any(e["event_name"] == step_event_names[0] for e in events):
-                step_users[0].add(uid)
-        self.step_counts = [len(step_users[0])]
-
-        # Subsequent steps: users from previous step who also triggered current step
-        for i in range(1, len(step_event_names)):
-            current_users = set()
-            for uid in step_users[i - 1]:
-                if any(e["event_name"] == step_event_names[i] for e in user_events.get(uid, [])):
-                    current_users.add(uid)
-            step_users.append(current_users)
-            self.step_counts.append(len(current_users))
-
-        # Calculate rates
-        self.step_rates = []
-        for i in range(len(self.step_counts)):
-            if i == 0:
-                self.step_rates.append(1.0)
-            else:
-                prev = self.step_counts[i - 1]
-                curr = self.step_counts[i]
-                self.step_rates.append(round(curr / prev, 4) if prev > 0 else 0.0)
-
-        if self.step_counts and self.step_counts[0] > 0:
-            self.total_conversion_rate = round(
-                self.step_counts[-1] / self.step_counts[0], 4
-            )
-
+        match = match_funnel(step_event_names, self.conversion_window_hours, user_events)
+        self.step_counts = match.step_counts
+        self.step_rates = match.step_rates
+        self.total_conversion_rate = match.total_conversion_rate
+        self.conversion_paths = match.confirmed_paths
+        self.rejected_paths = match.rejected
         return self
 
 
@@ -896,85 +936,121 @@ def _betai(a: float, b: float, x: float) -> float:
 # 归因算法实现
 # ============================================================
 
-def _first_touch_attribution(
+def _prepare_attribution_inputs(
     touchpoints: list[dict[str, Any]],
     conversions: list[dict[str, Any]],
     window_days: int,
-) -> dict[str, float]:
-    """首次触点归因：100% 权重给第一个触点。"""
+) -> dict[str, Any]:
+    """归因前统一清洗：订单去重、窗口核验、乱序安全的时间排序。
+
+    - 同一 ``order_id`` 的重复转化只保留最早的一次，重复提交只记一次；
+    - 触点必须不晚于购买时刻，且与购买时刻的间隔不超过归因窗口；
+    - 所有触点按 timestamp 排序，原始事件乱序送入也能得到同样结果。
+    """
+    from app.funnel_engine import parse_event_time
+
+    window = timedelta(days=window_days)
+    deduped_conversions: dict[Any, dict[str, Any]] = {}
+    for conversion in conversions:
+        order_id = conversion.get("order_id")
+        key = order_id if order_id is not None else (
+            conversion["user_id"], conversion.get("conversion_time")
+        )
+        existing = deduped_conversions.get(key)
+        if existing is None or conversion.get("conversion_time", "") < existing.get("conversion_time", ""):
+            deduped_conversions[key] = conversion
+    clean_conversions = list(deduped_conversions.values())
+
+    eligible: list[dict[str, Any]] = []
+    for tp in touchpoints:
+        matching = [
+            c for c in clean_conversions if c["user_id"] == tp["user_id"]
+        ]
+        if not matching:
+            continue
+        try:
+            tp_time = parse_event_time(tp.get("timestamp", ""))
+        except (ValueError, TypeError):
+            continue
+        for conversion in matching:
+            try:
+                conv_time = parse_event_time(conversion["conversion_time"])
+            except (ValueError, TypeError):
+                continue
+            delta = conv_time - tp_time
+            # 触点晚于购买（早到购买错位）或超出归因窗口：不参与归因
+            if timedelta(0) <= delta <= window:
+                eligible.append({**tp, "_conversion_time": conversion["conversion_time"]})
+                break
+
+    eligible.sort(key=lambda x: x.get("timestamp", ""))
+    return {
+        "touchpoints": eligible,
+        "conversions": clean_conversions,
+        "window_days": window_days,
+    }
+
+
+def _normalize_weights(weights: dict[str, float]) -> dict[str, float]:
+    total = sum(weights.values())
+    if total > 0:
+        for ch in weights:
+            weights[ch] = round(weights[ch] / total, 4)
+    return weights
+
+
+def _first_touch_attribution(prepared: dict[str, Any]) -> dict[str, float]:
+    """首次触点归因：100% 权重给窗口内最早的触点。"""
     weights: dict[str, float] = {}
-    converted_users = {c["user_id"] for c in conversions}
+    converted_users = {c["user_id"] for c in prepared["conversions"]}
     user_first_touch: dict[str, str] = {}
-    for tp in sorted(touchpoints, key=lambda x: x.get("timestamp", "")):
+    for tp in prepared["touchpoints"]:
         uid = tp["user_id"]
         if uid in converted_users and uid not in user_first_touch:
             user_first_touch[uid] = tp.get("channel", "unknown")
     for channel in user_first_touch.values():
         weights[channel] = weights.get(channel, 0.0) + 1.0
-    total = sum(weights.values())
-    if total > 0:
-        for ch in weights:
-            weights[ch] = round(weights[ch] / total, 4)
-    return weights
+    return _normalize_weights(weights)
 
 
-def _last_touch_attribution(
-    touchpoints: list[dict[str, Any]],
-    conversions: list[dict[str, Any]],
-    window_days: int,
-) -> dict[str, float]:
-    """末次触点归因：100% 权重给最后一个触点。"""
+def _last_touch_attribution(prepared: dict[str, Any]) -> dict[str, float]:
+    """末次触点归因：100% 权重给购买前的最后一个触点。"""
     weights: dict[str, float] = {}
-    converted_users = {c["user_id"] for c in conversions}
+    converted_users = {c["user_id"] for c in prepared["conversions"]}
     seen_users: set[str] = set()
-    for tp in reversed(touchpoints):
+    # 触点已按时间升序，反向扫描即为“离购买最近的触点”
+    for tp in reversed(prepared["touchpoints"]):
         uid = tp["user_id"]
         if uid in converted_users and uid not in seen_users:
             seen_users.add(uid)
             ch = tp.get("channel", "unknown")
             weights[ch] = weights.get(ch, 0.0) + 1.0
-    total = sum(weights.values())
-    if total > 0:
-        for ch in weights:
-            weights[ch] = round(weights[ch] / total, 4)
-    return weights
+    return _normalize_weights(weights)
 
 
-def _linear_attribution(
-    touchpoints: list[dict[str, Any]],
-    conversions: list[dict[str, Any]],
-    window_days: int,
-) -> dict[str, float]:
-    """线性归因：权重平均分配给所有触点。"""
+def _linear_attribution(prepared: dict[str, Any]) -> dict[str, float]:
+    """线性归因：权重平均分配给窗口内所有触点。"""
     weights: dict[str, float] = {}
-    converted_users = {c["user_id"] for c in conversions}
+    converted_users = {c["user_id"] for c in prepared["conversions"]}
     user_touchpoints: dict[str, list[str]] = {}
-    for tp in touchpoints:
+    for tp in prepared["touchpoints"]:
         uid = tp["user_id"]
         if uid in converted_users:
             user_touchpoints.setdefault(uid, []).append(tp.get("channel", "unknown"))
-    for uid, channels in user_touchpoints.items():
+    for channels in user_touchpoints.values():
         weight_per_touch = 1.0 / len(channels)
         for ch in channels:
             weights[ch] = weights.get(ch, 0.0) + weight_per_touch
-    total = sum(weights.values())
-    if total > 0:
-        for ch in weights:
-            weights[ch] = round(weights[ch] / total, 4)
-    return weights
+    return _normalize_weights(weights)
 
 
-def _time_decay_attribution(
-    touchpoints: list[dict[str, Any]],
-    conversions: list[dict[str, Any]],
-    window_days: int,
-) -> dict[str, float]:
+def _time_decay_attribution(prepared: dict[str, Any]) -> dict[str, float]:
     """时间衰减归因：离转化越近的触点权重越高。"""
     weights: dict[str, float] = {}
     converted_users = {
-        c["user_id"]: c.get("conversion_time", "") for c in conversions
+        c["user_id"]: c.get("conversion_time", "") for c in prepared["conversions"]
     }
-    for tp in touchpoints:
+    for tp in prepared["touchpoints"]:
         uid = tp["user_id"]
         if uid not in converted_users:
             continue
@@ -984,43 +1060,35 @@ def _time_decay_attribution(
         if tp_time == conv_time:
             w = 1.0
         else:
-            # Simple inverse time decay
-            from datetime import datetime
+            from app.funnel_engine import parse_event_time
+
             try:
-                d1 = datetime.fromisoformat(tp_time.replace("Z", "+00:00"))
-                d2 = datetime.fromisoformat(conv_time.replace("Z", "+00:00"))
-                diff_days = abs((d2 - d1).total_seconds()) / 86400.0
+                d1 = parse_event_time(tp_time)
+                d2 = parse_event_time(conv_time)
+                diff_days = (d2 - d1).total_seconds() / 86400.0
                 half_life = 7.0
                 w = 2.0 ** (-diff_days / half_life)
             except (ValueError, TypeError):
                 w = 0.5
         weights[ch] = weights.get(ch, 0.0) + w
-    total = sum(weights.values())
-    if total > 0:
-        for ch in weights:
-            weights[ch] = round(weights[ch] / total, 4)
-    return weights
+    return _normalize_weights(weights)
 
 
-def _position_based_attribution(
-    touchpoints: list[dict[str, Any]],
-    conversions: list[dict[str, Any]],
-    window_days: int,
-) -> dict[str, float]:
+def _position_based_attribution(prepared: dict[str, Any]) -> dict[str, float]:
     """位置归因：40% 首个 + 40% 末次 + 20% 中间平均。"""
     first_rate = 0.4
     last_rate = 0.4
     middle_rate = 0.2
 
     weights: dict[str, float] = {}
-    converted_users = {c["user_id"] for c in conversions}
+    converted_users = {c["user_id"] for c in prepared["conversions"]}
     user_tps: dict[str, list[dict[str, Any]]] = {}
-    for tp in sorted(touchpoints, key=lambda x: x.get("timestamp", "")):
+    for tp in prepared["touchpoints"]:
         uid = tp["user_id"]
         if uid in converted_users:
             user_tps.setdefault(uid, []).append(tp)
 
-    for uid, tps in user_tps.items():
+    for tps in user_tps.values():
         n = len(tps)
         for i, tp in enumerate(tps):
             ch = tp.get("channel", "unknown")
@@ -1031,11 +1099,7 @@ def _position_based_attribution(
             else:
                 w = middle_rate / (n - 2) if n > 2 else 0
             weights[ch] = weights.get(ch, 0.0) + w
-    total = sum(weights.values())
-    if total > 0:
-        for ch in weights:
-            weights[ch] = round(weights[ch] / total, 4)
-    return weights
+    return _normalize_weights(weights)
 
 
 # ============================================================

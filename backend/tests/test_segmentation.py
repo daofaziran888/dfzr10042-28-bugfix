@@ -29,9 +29,15 @@ from app.models import (
     _moving_average_anomaly_detect,
     _percentile,
     _position_based_attribution,
+    _prepare_attribution_inputs,
     _time_decay_attribution,
     _zscore_anomaly_detect,
 )
+
+
+def _prepared(touchpoints, conversions, window_days=30):
+    """旧测试辅助：按新签名生成清洗后的归因输入。"""
+    return _prepare_attribution_inputs(touchpoints, conversions, window_days)
 
 
 # ============================================================
@@ -150,22 +156,23 @@ class TestFunnelDef:
             funnel_id="FUN_ACQ",
             funnel_name="获客漏斗",
             steps=steps,
+            conversion_window_hours=24,
         )
         user_events = {
             "u1": [
-                {"event_name": "用户注册", "timestamp": "T1"},
-                {"event_name": "首次登录", "timestamp": "T2"},
-                {"event_name": "支付成功", "timestamp": "T3"},
+                {"event_name": "用户注册", "timestamp": "2026-11-01T08:00:00"},
+                {"event_name": "首次登录", "timestamp": "2026-11-01T09:00:00"},
+                {"event_name": "支付成功", "timestamp": "2026-11-01T10:00:00"},
             ],
             "u2": [
-                {"event_name": "用户注册", "timestamp": "T1"},
-                {"event_name": "首次登录", "timestamp": "T2"},
+                {"event_name": "用户注册", "timestamp": "2026-11-01T08:00:00"},
+                {"event_name": "首次登录", "timestamp": "2026-11-01T09:00:00"},
             ],
             "u3": [
-                {"event_name": "用户注册", "timestamp": "T1"},
+                {"event_name": "用户注册", "timestamp": "2026-11-01T08:00:00"},
             ],
             "u4": [
-                {"event_name": "首次登录", "timestamp": "T1"},
+                {"event_name": "首次登录", "timestamp": "2026-11-01T08:00:00"},
             ],
         }
         result = funnel.compute_funnel(user_events)
@@ -174,21 +181,91 @@ class TestFunnelDef:
         assert result.step_rates[1] == round(2/3, 4)  # 2/3
         assert result.step_rates[2] == 0.5  # 1/2
         assert result.total_conversion_rate == round(1/3, 4)
+        assert len(result.conversion_paths) == 1
+        assert result.conversion_paths[0]["user_id"] == "u1"
+
+    def test_funnel_rejects_purchase_before_entry(self):
+        """先购买后进店：早到购买不能错位计入后续步骤。"""
+        steps = [
+            EventTrack(event_id="E1", event_name="进店"),
+            EventTrack(event_id="E2", event_name="购买"),
+        ]
+        funnel = FunnelDef(
+            funnel_id="FUN_EARLY", funnel_name="早到购买",
+            steps=steps, conversion_window_hours=24,
+        )
+        user_events = {
+            "u1": [
+                {"event_name": "购买", "timestamp": "2026-11-01T08:00:00", "order_id": "O1"},
+                {"event_name": "进店", "timestamp": "2026-11-01T10:00:00"},
+            ],
+        }
+        result = funnel.compute_funnel(user_events)
+        assert result.step_counts == [1, 0]
+        assert result.total_conversion_rate == 0.0
+        assert result.conversion_paths == []
+        assert result.rejected_paths[0]["reason"] == "out_of_order_purchase"
+
+    def test_funnel_rejects_purchase_outside_window(self):
+        """超过转化窗口的购买不能残留在转化分母里。"""
+        steps = [
+            EventTrack(event_id="E1", event_name="进店"),
+            EventTrack(event_id="E2", event_name="购买"),
+        ]
+        funnel = FunnelDef(
+            funnel_id="FUN_WIN", funnel_name="超窗购买",
+            steps=steps, conversion_window_hours=24,
+        )
+        user_events = {
+            "u1": [
+                {"event_name": "进店", "timestamp": "2026-11-01T10:00:00"},
+                {"event_name": "购买", "timestamp": "2026-11-03T10:00:00", "order_id": "O2"},
+            ],
+        }
+        result = funnel.compute_funnel(user_events)
+        assert result.step_counts == [1, 0]
+        assert result.conversion_paths == []
+        assert result.rejected_paths[0]["reason"] == "outside_window"
+
+    def test_funnel_duplicate_order_counts_once(self):
+        """同一订单重复提交只确认一次，同一用户每步最多计一人。"""
+        steps = [
+            EventTrack(event_id="E1", event_name="进店"),
+            EventTrack(event_id="E2", event_name="购买"),
+        ]
+        funnel = FunnelDef(
+            funnel_id="FUN_DUP", funnel_name="重复订单",
+            steps=steps, conversion_window_hours=24,
+        )
+        user_events = {
+            "u1": [
+                {"event_name": "进店", "timestamp": "2026-11-01T08:00:00"},
+                {"event_name": "购买", "timestamp": "2026-11-01T09:00:00", "order_id": "O3"},
+                {"event_name": "购买", "timestamp": "2026-11-01T09:00:00", "order_id": "O3"},
+            ],
+        }
+        result = funnel.compute_funnel(user_events)
+        assert result.step_counts == [1, 1]
+        assert len(result.conversion_paths) == 1
+        assert result.conversion_paths[0]["order_id"] == "O3"
 
     def test_funnel_all_convert(self):
         steps = [
             EventTrack(event_id="E1", event_name="页面浏览"),
             EventTrack(event_id="E2", event_name="点击商品"),
         ]
-        funnel = FunnelDef(funnel_id="FUN_ALL", funnel_name="全面转化", steps=steps)
+        funnel = FunnelDef(
+            funnel_id="FUN_ALL", funnel_name="全面转化",
+            steps=steps, conversion_window_hours=24,
+        )
         user_events = {
             "u1": [
-                {"event_name": "页面浏览", "timestamp": "T1"},
-                {"event_name": "点击商品", "timestamp": "T2"},
+                {"event_name": "页面浏览", "timestamp": "2026-11-01T10:00:00"},
+                {"event_name": "点击商品", "timestamp": "2026-11-01T11:00:00"},
             ],
             "u2": [
-                {"event_name": "页面浏览", "timestamp": "T1"},
-                {"event_name": "点击商品", "timestamp": "T2"},
+                {"event_name": "页面浏览", "timestamp": "2026-11-01T10:00:00"},
+                {"event_name": "点击商品", "timestamp": "2026-11-01T11:00:00"},
             ],
         }
         result = funnel.compute_funnel(user_events)
@@ -197,7 +274,7 @@ class TestFunnelDef:
 
     def test_funnel_empty_steps(self):
         funnel = FunnelDef(funnel_id="FUN_EMPTY", funnel_name="空漏斗", steps=[])
-        user_events = {"u1": [{"event_name": "test", "timestamp": "T1"}]}
+        user_events = {"u1": [{"event_name": "test", "timestamp": "2026-11-01T10:00:00"}]}
         result = funnel.compute_funnel(user_events)
         assert result.step_counts == []
 
@@ -206,15 +283,50 @@ class TestFunnelDef:
             EventTrack(event_id="E1", event_name="浏览"),
             EventTrack(event_id="E2", event_name="购买"),
         ]
-        funnel = FunnelDef(funnel_id="FUN_DET", funnel_name="确定性", steps=steps)
+        funnel = FunnelDef(
+            funnel_id="FUN_DET", funnel_name="确定性",
+            steps=steps, conversion_window_hours=24,
+        )
         user_events = {
-            "u1": [{"event_name": "浏览", "timestamp": "T1"}, {"event_name": "购买", "timestamp": "T2"}],
-            "u2": [{"event_name": "浏览", "timestamp": "T1"}],
+            "u1": [
+                {"event_name": "浏览", "timestamp": "2026-11-01T10:00:00"},
+                {"event_name": "购买", "timestamp": "2026-11-01T11:00:00"},
+            ],
+            "u2": [{"event_name": "浏览", "timestamp": "2026-11-01T10:00:00"}],
         }
         r1 = funnel.compute_funnel(dict(user_events))
         r2 = funnel.compute_funnel(dict(user_events))
         assert r1.step_counts == r2.step_counts
         assert r1.total_conversion_rate == r2.total_conversion_rate
+        assert r1.conversion_paths == r2.conversion_paths
+
+    def test_funnel_ingest_order_invariant(self):
+        """乱序送入和按时间送入的匹配结果一致。"""
+        steps = [
+            EventTrack(event_id="E1", event_name="进店"),
+            EventTrack(event_id="E2", event_name="咨询"),
+            EventTrack(event_id="E3", event_name="购买"),
+        ]
+        ordered = {
+            "u1": [
+                {"event_name": "进店", "timestamp": "2026-11-01T08:00:00"},
+                {"event_name": "咨询", "timestamp": "2026-11-01T09:00:00"},
+                {"event_name": "购买", "timestamp": "2026-11-01T10:00:00", "order_id": "O4"},
+            ],
+        }
+        shuffled = {
+            "u1": [
+                {"event_name": "购买", "timestamp": "2026-11-01T10:00:00", "order_id": "O4"},
+                {"event_name": "进店", "timestamp": "2026-11-01T08:00:00"},
+                {"event_name": "咨询", "timestamp": "2026-11-01T09:00:00"},
+            ],
+        }
+        f1 = FunnelDef(funnel_id="F1", funnel_name="f", steps=steps,
+                       conversion_window_hours=24).compute_funnel(ordered)
+        f2 = FunnelDef(funnel_id="F2", funnel_name="f", steps=steps,
+                       conversion_window_hours=24).compute_funnel(shuffled)
+        assert f1.step_counts == f2.step_counts == [1, 1, 1]
+        assert f1.conversion_paths == f2.conversion_paths
 
 
 # ============================================================
@@ -305,7 +417,7 @@ class TestAttributionModel:
         ]
 
     def test_first_touch_attribution(self, touchpoints, conversions):
-        weights = _first_touch_attribution(touchpoints, conversions, 30)
+        weights = _first_touch_attribution(_prepared(touchpoints, conversions))
         # u1 first: organic, u2 first: paid, u3 first: wechat
         assert weights["organic"] == round(1/3, 4)
         assert weights["paid"] == round(1/3, 4)
@@ -313,7 +425,7 @@ class TestAttributionModel:
         assert abs(sum(weights.values()) - 1.0) < 0.01
 
     def test_last_touch_attribution(self, touchpoints, conversions):
-        weights = _last_touch_attribution(touchpoints, conversions, 30)
+        weights = _last_touch_attribution(_prepared(touchpoints, conversions))
         # u1 last: email, u2 last: organic, u3 last: paid
         assert weights["email"] == round(1/3, 4)
         assert weights["organic"] == round(1/3, 4)
@@ -321,7 +433,7 @@ class TestAttributionModel:
         assert abs(sum(weights.values()) - 1.0) < 0.01
 
     def test_linear_attribution(self, touchpoints, conversions):
-        weights = _linear_attribution(touchpoints, conversions, 30)
+        weights = _linear_attribution(_prepared(touchpoints, conversions))
         # u1: 3 touches (organic/paid/email) -> each 1/3 weight
         # u2: 2 touches (paid/organic) -> each 1/2 weight
         # u3: 3 touches (wechat/email/paid) -> each 1/3 weight
@@ -339,13 +451,50 @@ class TestAttributionModel:
         assert abs(sum(weights.values()) - 1.0) < 0.01
 
     def test_position_based_attribution(self, touchpoints, conversions):
-        weights = _position_based_attribution(touchpoints, conversions, 30)
+        weights = _position_based_attribution(_prepared(touchpoints, conversions))
         assert "organic" in weights
         assert sum(weights.values()) > 0.99
 
     def test_time_decay_attribution(self, touchpoints, conversions):
-        weights = _time_decay_attribution(touchpoints, conversions, 30)
+        weights = _time_decay_attribution(_prepared(touchpoints, conversions))
         assert sum(weights.values()) > 0.99
+
+    def test_attribution_excludes_touch_after_purchase(self, touchpoints, conversions):
+        """晚于购买的触点（早到购买错位）不参与归因。"""
+        prepared = _prepared(touchpoints, conversions)
+        for tp in prepared["touchpoints"]:
+            assert tp["timestamp"] <= tp["_conversion_time"]
+
+    def test_attribution_excludes_touch_outside_window(self):
+        """超出归因窗口的触点不参与归因。"""
+        touchpoints = [
+            {"user_id": "u1", "channel": "paid",
+             "timestamp": "2026-10-01T08:00:00Z"},
+            {"user_id": "u1", "channel": "organic",
+             "timestamp": "2026-11-01T08:00:00Z"},
+        ]
+        conversions = [
+            {"user_id": "u1", "conversion_time": "2026-11-01T10:00:00Z",
+             "order_id": "O9"},
+        ]
+        prepared = _prepared(touchpoints, conversions, window_days=7)
+        channels = {tp["channel"] for tp in prepared["touchpoints"]}
+        assert channels == {"organic"}
+
+    def test_attribution_dedupes_duplicate_orders(self):
+        """同一 order_id 重复提交只计一次。"""
+        touchpoints = [
+            {"user_id": "u1", "channel": "paid",
+             "timestamp": "2026-11-01T08:00:00Z", "order_id": "O9"},
+        ]
+        conversions = [
+            {"user_id": "u1", "conversion_time": "2026-11-01T10:00:00Z",
+             "order_id": "O9"},
+            {"user_id": "u1", "conversion_time": "2026-11-01T10:00:00Z",
+             "order_id": "O9"},
+        ]
+        prepared = _prepared(touchpoints, conversions, window_days=30)
+        assert len(prepared["conversions"]) == 1
 
     def test_full_attribution_model(self, touchpoints, conversions):
         model = AttributionModel(

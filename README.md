@@ -35,6 +35,19 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 健康检查：`curl http://127.0.0.1:8000/api/health`
 
+漏斗复盘专用接口（`backend/app/routers/funnel_review.py`）：
+
+- `POST /api/funnel-review/compute`：按事件时间核验进店→咨询→购买等步骤
+  顺序与转化窗口，返回各步人数、已确认转化路径、被拒路径（早到购买
+  `out_of_order_purchase`、超窗购买 `outside_window`、重复订单
+  `duplicate_order`）和已发布分母。
+- `POST /api/funnel-review/channel-attribution`：按渠道各发起一次漏斗复盘，
+  并对同一笔购买做跨渠道归因仲裁；同一订单全平台只贡献一次，权重只分给
+  有完整证据路径的渠道。
+
+事件可乱序或按时间送入，引擎先按 timestamp 归一化排序去重，已发布结果
+可用原始事件快照通过 `FunnelReview.recompute()` 复算。
+
 ### 前端
 
 ```bash

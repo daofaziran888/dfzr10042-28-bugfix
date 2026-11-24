@@ -367,6 +367,61 @@ def pipeline_attribution_to_funnel(
     }
 
 
+def pipeline_channel_funnel_review(
+    models: list[AttributionModel],
+    step_event_names: list[str],
+    window_hours: int,
+    raw_events_by_channel: dict[str, dict[str, list[dict[str, Any]]]],
+) -> dict[str, Any]:
+    """按渠道各发起一次漏斗复盘并做跨渠道归因仲裁。
+
+    漏斗引擎先按事件时间核验步骤顺序和转化窗口，只有完整且在窗内的
+    路径才能发布进复盘分母；随后归因模型从确认路径的实际进店触点与
+    购买时刻重新分配权重，保证同一笔购买只贡献一次、早到与超窗购买
+    不参与归因。结果对事件送入顺序不敏感，可用原始事件快照复算。
+    """
+    from app.attribution_review import (
+        arbitrate_order_attribution,
+        run_channel_review,
+    )
+
+    model = models[0] if models else None
+    if model is None:
+        return {
+            "pipeline": "attribution_model -> event_track -> funnel_def (channel review)",
+            "reviews": [],
+            "arbitration": None,
+        }
+
+    reviews = []
+    for index, (channel, raw_events) in enumerate(raw_events_by_channel.items(), start=1):
+        reviews.append(run_channel_review(
+            review_id=f"REV-{model.model_id}-{index}",
+            channel=channel,
+            step_event_names=step_event_names,
+            window_hours=window_hours,
+            raw_events=raw_events,
+            model=model,
+        ))
+    arbitration = arbitrate_order_attribution(reviews, model)
+    return {
+        "pipeline": "attribution_model -> event_track -> funnel_def (channel review)",
+        "reviews": [
+            {
+                "review_id": review["review_id"],
+                "channel": review["channel"],
+                "published_denominator": review["published_denominator"],
+                "step_counts": review["step_counts"],
+                "total_conversion_rate": review["total_conversion_rate"],
+                "rejected": review["rejected"],
+                "attribution": review["attribution"],
+            }
+            for review in reviews
+        ],
+        "arbitration": arbitration,
+    }
+
+
 # ============================================================
 # 流 6: segment_builder -> cohort_analysis
 # 群体圈选 -> 同期群分析
